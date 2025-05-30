@@ -1,9 +1,18 @@
-import javax.swing.*;
-import java.sql.*;
+
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
-import java.util.HashSet;
-import java.util.Set;
+import java.util.*;
+import com.google.gson.*;
+import com.google.gson.reflect.TypeToken;
+import java.io.IOException;
+import java.io.Reader;
+import java.io.Writer;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.security.MessageDigest;
+import javax.swing.JOptionPane;
+import javax.swing.JScrollPane;
+import javax.swing.JTextArea;
 
 class User {
     private final String username;
@@ -66,11 +75,20 @@ final class Message {
     }
 
     public String createMessageHash() {
-        String idPart = messageID.substring(0, 2);
-        String msgPart = messageText.length() > 2
-            ? messageText.substring(0, 1).toUpperCase() + messageText.substring(messageText.length() - 1).toUpperCase()
-            : messageText.toUpperCase();
-        return idPart + ":" + msgPart;
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            String input = messageID + recipient + messageText + date + time;
+            byte[] hash = digest.digest(input.getBytes("UTF-8"));
+            StringBuilder hexString = new StringBuilder();
+            for (byte b : hash) {
+                String hex = Integer.toHexString(0xff & b);
+                if(hex.length() == 1) hexString.append('0');
+                hexString.append(hex);
+            }
+            return hexString.toString().substring(0, 12); // Shorten for display
+        } catch (Exception ex) {
+            return "HASH_ERR";
+        }
     }
 
     public static boolean isValidMessage(String msg) {
@@ -87,62 +105,37 @@ final class Message {
 }
 
 public class MainApp {
-    private static final String DB_URL = "jdbc:sqlite:messages.db";
+    private static final String USERS_FILE = "users.json";
+    private static final String MESSAGES_FILE = "messages.json";
     private static User currentUser = null;
+    private static List<User> users = new ArrayList<>();
+    private static List<Message> messages = new ArrayList<>();
+    private static final Gson gson = new GsonBuilder().setPrettyPrinting().create();
 
     public static void main(String[] args) {
-        setupDatabase();
+        loadUsers();
+        loadMessages();
         while (true) {
-            String[] mainOptions = {"Register", "Login", "Exit"};
-            int mainChoice = JOptionPane.showOptionDialog(null, "Welcome! Please choose an option:",
-                    "Main Menu", JOptionPane.DEFAULT_OPTION, JOptionPane.INFORMATION_MESSAGE,
-                    null, mainOptions, mainOptions[0]);
-            if (mainChoice == 0) {
-                registerUser();
-            } else if (mainChoice == 1) {
-                if (loginUser()) {
-                    userMenu();
-                }
-            } else {
-                JOptionPane.showMessageDialog(null, "Goodbye!");
-                break;
+            String menu = "Main Menu:\n1. Register\n2. Login\n3. Exit\nEnter your choice (1-3):";
+            String input = JOptionPane.showInputDialog(menu);
+            if (input == null) break;
+            switch (input) {
+                case "1":
+                    registerUser();
+                    break;
+                case "2":
+                    if (loginUser()) {
+                        userMenu();
+                    }
+                    break;
+                case "3":
+                    JOptionPane.showMessageDialog(null, "Goodbye!");
+                    saveUsers();
+                    saveMessages();
+                    return;
+                default:
+                    JOptionPane.showMessageDialog(null, "Invalid choice. Please enter 1, 2, or 3.");
             }
-        }
-    }
-
-    // --- SCHEMA MIGRATION LOGIC ---
-    private static void setupDatabase() {
-        try (Connection conn = DriverManager.getConnection(DB_URL)) {
-            // Create users table if not exists
-            String sqlUsers = "CREATE TABLE IF NOT EXISTS users (" +
-                    "username TEXT PRIMARY KEY," +
-                    "password TEXT," +
-                    "cell TEXT" +
-                    ")";
-            Statement stmt = conn.createStatement();
-            stmt.execute(sqlUsers);
-
-            // Create messages table if not exists (with only id column, will migrate below)
-            String sqlMessages = "CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY)";
-            stmt.execute(sqlMessages);
-
-            // Get existing columns
-            Set<String> columns = new HashSet<>();
-            ResultSet rs = stmt.executeQuery("PRAGMA table_info(messages)");
-            while (rs.next()) {
-                columns.add(rs.getString("name"));
-            }
-
-            // Add missing columns
-            String[] needed = {"recipient TEXT", "message TEXT", "hash TEXT", "date TEXT", "time TEXT"};
-            String[] colNames = {"recipient", "message", "hash", "date", "time"};
-            for (int i = 0; i < needed.length; i++) {
-                if (!columns.contains(colNames[i])) {
-                    stmt.execute("ALTER TABLE messages ADD COLUMN " + needed[i]);
-                }
-            }
-        } catch (SQLException e) {
-            JOptionPane.showMessageDialog(null, "Database setup error: " + e.getMessage());
         }
     }
 
@@ -183,18 +176,17 @@ public class MainApp {
             }
         }
 
-        // Save user to DB
-        try (Connection conn = DriverManager.getConnection(DB_URL)) {
-            String sql = "INSERT INTO users (username, password, cell) VALUES (?, ?, ?)";
-            PreparedStatement pstmt = conn.prepareStatement(sql);
-            pstmt.setString(1, username);
-            pstmt.setString(2, password);
-            pstmt.setString(3, cell);
-            pstmt.executeUpdate();
-            JOptionPane.showMessageDialog(null, "Registration successful! You can now log in.");
-        } catch (SQLException e) {
-            JOptionPane.showMessageDialog(null, "Registration failed: " + e.getMessage());
+        // Check for duplicate username
+        for (User u : users) {
+            if (u.getUsername().equals(username)) {
+                JOptionPane.showMessageDialog(null, "Username already exists. Please choose another.");
+                return;
+            }
         }
+
+        users.add(new User(username, password, cell));
+        saveUsers();
+        JOptionPane.showMessageDialog(null, "Registration successful! You can now log in.");
     }
 
     private static boolean loginUser() {
@@ -203,40 +195,35 @@ public class MainApp {
         String password = JOptionPane.showInputDialog("Login - Enter password:");
         if (password == null) return false;
 
-        try (Connection conn = DriverManager.getConnection(DB_URL)) {
-            String sql = "SELECT * FROM users WHERE username = ? AND password = ?";
-            PreparedStatement pstmt = conn.prepareStatement(sql);
-            pstmt.setString(1, username);
-            pstmt.setString(2, password);
-            ResultSet rs = pstmt.executeQuery();
-            if (rs.next()) {
-                currentUser = new User(rs.getString("username"), rs.getString("password"), rs.getString("cell"));
+        for (User u : users) {
+            if (u.getUsername().equals(username) && u.getPassword().equals(password)) {
+                currentUser = u;
                 JOptionPane.showMessageDialog(null, "Welcome " + currentUser.getUsername() + ", it is great to see you again.");
                 return true;
-            } else {
-                JOptionPane.showMessageDialog(null, "Username or password incorrect, please try again.");
-                return false;
             }
-        } catch (SQLException e) {
-            JOptionPane.showMessageDialog(null, "Login failed: " + e.getMessage());
-            return false;
         }
+        JOptionPane.showMessageDialog(null, "Username or password incorrect, please try again.");
+        return false;
     }
 
     private static void userMenu() {
         while (true) {
-            String[] userOptions = {"Send Message(s)", "View Messages", "Logout"};
-            int userChoice = JOptionPane.showOptionDialog(null, "Welcome, " + currentUser.getUsername() + "! Choose an option:",
-                    "User Menu", JOptionPane.DEFAULT_OPTION, JOptionPane.INFORMATION_MESSAGE,
-                    null, userOptions, userOptions[0]);
-            if (userChoice == 0) {
-                sendMessages();
-            } else if (userChoice == 1) {
-                showAllMessages();
-            } else {
-                JOptionPane.showMessageDialog(null, "Logged out.");
-                currentUser = null;
-                break;
+            String menu = "User Menu:\n1. Send Message(s)\n2. View Messages\n3. Logout\nEnter your choice (1-3):";
+            String input = JOptionPane.showInputDialog(menu);
+            if (input == null) return;
+            switch (input) {
+                case "1":
+                    sendMessages();
+                    break;
+                case "2":
+                    showAllMessages();
+                    break;
+                case "3":
+                    JOptionPane.showMessageDialog(null, "Logged out.");
+                    currentUser = null;
+                    return;
+                default:
+                    JOptionPane.showMessageDialog(null, "Invalid choice. Please enter 1, 2, or 3.");
             }
         }
     }
@@ -291,55 +278,68 @@ public class MainApp {
                 "\nTime: " + m.getTime()
             );
 
-            // Save to DB
-            saveMessageToDB(m);
+            // Save to JSON
+            messages.add(m);
         }
-
-        JOptionPane.showMessageDialog(null, "Total messages sent: " + Message.getMessageCount() + "\nMessages saved to SQLite database.");
-    }
-
-    private static void saveMessageToDB(Message m) {
-        String sql = "INSERT INTO messages (id, recipient, message, hash, date, time) VALUES (?, ?, ?, ?, ?, ?)";
-        try (Connection conn = DriverManager.getConnection(DB_URL);
-             PreparedStatement pstmt = conn.prepareStatement(sql)) {
-            pstmt.setString(1, m.getMessageID());
-            pstmt.setString(2, m.getRecipient());
-            pstmt.setString(3, m.getMessageText());
-            pstmt.setString(4, m.getMessageHash());
-            pstmt.setString(5, m.getDate());
-            pstmt.setString(6, m.getTime());
-            pstmt.executeUpdate();
-        } catch (SQLException e) {
-            JOptionPane.showMessageDialog(null, "Error saving message: " + e.getMessage());
-        }
+        saveMessages();
+        JOptionPane.showMessageDialog(null, "Total messages sent: " + Message.getMessageCount() + "\nMessages saved to JSON file.");
     }
 
     private static void showAllMessages() {
         StringBuilder sb = new StringBuilder();
-        try (Connection conn = DriverManager.getConnection(DB_URL);
-             Statement stmt = conn.createStatement()) {
-            ResultSet rs = stmt.executeQuery("SELECT * FROM messages");
-            int count = 0;
-            while (rs.next()) {
-                sb.append("Message ID: ").append(rs.getString("id")).append("\n");
-                sb.append("Recipient: ").append(rs.getString("recipient")).append("\n");
-                sb.append("Message: ").append(rs.getString("message")).append("\n");
-                sb.append("Hash: ").append(rs.getString("hash")).append("\n");
-                sb.append("Date: ").append(rs.getString("date")).append("\n");
-                sb.append("Time: ").append(rs.getString("time")).append("\n");
-                sb.append("--------------------------------------------------\n");
-                count++;
-            }
-            if (count == 0) {
-                sb.append("No messages found in the database.");
-            }
-        } catch (SQLException e) {
-            sb.append("Error reading messages: ").append(e.getMessage());
+        int count = 0;
+        for (Message m : messages) {
+            sb.append("Message ID: ").append(m.getMessageID()).append("\n");
+            sb.append("Recipient: ").append(m.getRecipient()).append("\n");
+            sb.append("Message: ").append(m.getMessageText()).append("\n");
+            sb.append("Hash: ").append(m.getMessageHash()).append("\n");
+            sb.append("Date: ").append(m.getDate()).append("\n");
+            sb.append("Time: ").append(m.getTime()).append("\n");
+            sb.append("--------------------------------------------------\n");
+            count++;
+        }
+        if (count == 0) {
+            sb.append("No messages found.");
         }
         JTextArea textArea = new JTextArea(sb.toString());
         textArea.setEditable(false);
         JScrollPane scrollPane = new JScrollPane(textArea);
         scrollPane.setPreferredSize(new java.awt.Dimension(600, 400));
         JOptionPane.showMessageDialog(null, scrollPane, "All Messages", JOptionPane.INFORMATION_MESSAGE);
+    }
+
+    // JSON persistence
+    private static void saveUsers() {
+        try (Writer writer = Files.newBufferedWriter(Paths.get(USERS_FILE))) {
+            gson.toJson(users, writer);
+        } catch (IOException e) {
+            JOptionPane.showMessageDialog(null, "Error saving users: " + e.getMessage());
+        }
+    }
+
+    private static void loadUsers() {
+        try (Reader reader = Files.newBufferedReader(Paths.get(USERS_FILE))) {
+            users = gson.fromJson(reader, new TypeToken<List<User>>(){}.getType());
+            if (users == null) users = new ArrayList<>();
+        } catch (IOException e) {
+            users = new ArrayList<>();
+        }
+    }
+
+    private static void saveMessages() {
+        try (Writer writer = Files.newBufferedWriter(Paths.get(MESSAGES_FILE))) {
+            gson.toJson(messages, writer);
+        } catch (IOException e) {
+            JOptionPane.showMessageDialog(null, "Error saving messages: " + e.getMessage());
+        }
+    }
+
+    private static void loadMessages() {
+        try (Reader reader = Files.newBufferedReader(Paths.get(MESSAGES_FILE))) {
+            messages = gson.fromJson(reader, new TypeToken<List<Message>>(){}.getType());
+            if (messages == null) messages = new ArrayList<>();
+        } catch (IOException e) {
+            messages = new ArrayList<>();
+        }
     }
 }
